@@ -21,16 +21,154 @@ SYSTEM_MODE(AUTOMATIC);
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // setup() runs once, when the device is first turned on
-void setup() {
-  // Put initialization like pinMode and begin functions here
+// En tu código de la antena nRF24:
+/*void setup() {
+  radio.begin();
+  radio.setPALevel(RF24_PA_MAX); // Máxima potencia para generar interferencia
+  radio.setChannel(10);          // Canal 10 del nRF24 (aprox 2410 MHz, canal 1 de Wi-Fi)
+  radio.openWritingPipe(pipe);
 }
 
-// loop() runs over and over again, as quickly as it can execute.
 void loop() {
-  // The core of your code will likely live here.
+  const char ruido[] = "1234567890123456789012345678901"; // Paquete pesado
+  
+  // Transmitir en bucle lo más rápido posible sin delays
+  radio.write(&ruido, sizeof(ruido)); 
+}
+*/
 
-  // Example: Publish event to cloud every 10 seconds. Uncomment the next 3 lines to try it!
-  // Log.info("Sending Hello World to the cloud!");
-  // Particle.publish("Hello world!");
-  // delay( 10 * 1000 ); // milliseconds and blocking - see docs for more info!
+
+
+// Configuramos el sistema en modo SEMI_AUTOMATIC para que no se trabe
+// intentando conectar a la nube si eliges el modo BLE.
+
+// Definición de los estados del menú
+enum ModoSistema {
+    MODO_MENU,
+    MODO_WIFI,
+    MODO_BLE
+};
+
+ModoSistema modoActual = MODO_MENU;
+unsigned long ultimoEscaneo = 0;
+
+// Prototipos de funciones
+void mostrarMenu();
+void ejecutarEscaneoWiFi();
+void onScanResultBLE(const BleScanResult* scanResult, void* context);
+void ejecutarEscaneoBLE();
+
+void setup() {
+    // Esperar hasta 5 segundos a que abras el monitor serie en la laptop
+    waitFor(Serial.isConnected, 5000);
+    mostrarMenu();
+}
+
+void loop() {
+    // 1. LEER LOS COMANDOS DESDE LA LAPTOP
+    if (Serial.available() > 0) {
+        char opcion = Serial.read();
+        
+        // Limpiar caracteres basura como saltos de línea (\n o \r)
+        if (opcion == '\n' || opcion == '\r') return;
+
+        if (opcion == '1') {
+            Log.info("=== Cambiando a Modo: Escáner Wi-Fi ===");
+            modoActual = MODO_WIFI;
+            ultimoEscaneo = 0; // Forzar escaneo inmediato
+        } 
+        else if (opcion == '2') {
+            Log.info("=== Cambiando a Modo: Escáner Bluetooth (BLE) ===");
+            modoActual = MODO_BLE;
+            ultimoEscaneo = 0;
+        } 
+        else if (opcion == 'm' || opcion == 'M') {
+            // Regresar al menú principal y apagar radios si es necesario
+            BLE.off();
+            modoActual = MODO_MENU;
+            mostrarMenu();
+        } 
+        else {
+            Log.warn("Opción no válida. Presiona 1, 2 o M.");
+        }
+    }
+
+    // 2. EJECUTAR EL MODO SELECCIONADO
+    switch (modoActual) {
+        case MODO_WIFI:
+            // Escanear cada 8 segundos
+            if (millis() - ultimoEscaneo >= 8000) {
+                ultimoEscaneo = millis();
+                ejecutarEscaneoWiFi();
+                Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú principal.");
+            }
+            break;
+
+        case MODO_BLE:
+            // El escaneo de BLE es síncrono y toma 4 segundos
+            ejecutarEscaneoBLE();
+            Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú principal.");
+            delay(4000); // Espera entre escaneos
+            break;
+
+        case MODO_MENU:
+            // No hacer nada, esperar la selección del usuario
+            break;
+    }
+}
+
+// Muestra el menú de opciones en la terminal de la laptop
+void mostrarMenu() {
+    Serial.println("\n=============================================");
+    Serial.println("          MENU DE SELECCION - PHOTON 2       ");
+    Serial.println("=============================================");
+    Serial.println(" 1. Activar Escáner de Canales Wi-Fi");
+    Serial.println(" 2. Activar Escáner de Dispositivos BLE");
+    Serial.println("---------------------------------------------");
+    Serial.println(" Escribe el número (1 o 2) y presiona Enter: ");
+    Serial.println("=============================================");
+}
+
+// 1. Añadimos primero una función "Manejadora" (Callback) para procesar cada red que encuentre el chip
+void manejarRedEncontrada(WiFiAccessPoint* ap, void* cookie) {
+    // Esta función se ejecuta automáticamente por cada red Wi-Fi que detecte el radio
+    Serial.printf("SSID: %-25s | Canal: %-3d | Señal: %d dBm\n", ap->ssid, ap->channel, ap->rssi);
+}
+
+// 2. Modificamos la función principal del escaneo
+void ejecutarEscaneoWiFi() {
+    Log.info("Escaneando canales Wi-Fi cercanos...");
+    Serial.println("\n--- REDES WI-FI DETECTADAS ---");
+    
+    // Llamamos a WiFi.scan pasándole nuestra función manejadora.
+    // El chip de radio se encarga de buscar y dirigir los resultados ahí.
+    int redesEncontradas = WiFi.scan(manejarRedEncontrada, NULL);
+    
+    if (redesEncontradas > 0) {
+        Serial.printf("-------------------------------\nTotal de redes impresas: %d\n\n", redesEncontradas);
+    } else {
+        Serial.println("No se detectaron redes en este escaneo o el radio está ocupado.");
+        Serial.println("-------------------------------\n");
+    }
+}
+
+// Callback obligatorio para procesar cada dispositivo Bluetooth encontrado
+void onScanResultBLE(const BleScanResult* scanResult, void* context) {
+    BleAddress addr = scanResult->address();
+    String name = scanResult->advertisingData().deviceName();
+    if (name.length() == 0) name = "[Anónimo]";
+
+    Serial.printf("MAC: %s | RSSI: %d dBm | Nombre: %s\n", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+}
+
+// Lógica del escáner Bluetooth
+void ejecutarEscaneoBLE() {
+    Log.info("Iniciando escaneo BLE (4 segundos)...");
+    Serial.println("\n--- DISPOSITIVOS BLE DETECTADOS ---");
+    
+    BLE.on();
+    BLE.setScanTimeout(400); // 400 unidades de 10ms = 4 segundos
+    BLE.scan(onScanResultBLE, NULL);
+    
+    Serial.println("-----------------------------------\n");
 }
