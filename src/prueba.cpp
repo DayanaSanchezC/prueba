@@ -6,14 +6,16 @@
 #include "Particle.h"
 #include <RF24.h>
 
+// Pines idénticos a tu diagrama físico
 uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg);
 void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uint64_t dir, char id);
 void aplicarModoA_Antenas(int modo);
 void setup();
 void loop();
-#line 4 "c:/Users/sanch/ONEDRI~2/Escritorio/antena/jammer/src/prueba.ino"
+#line 5 "c:/Users/sanch/ONEDRI~2/Escritorio/antena/jammer/src/prueba.ino"
 #define CE_PIN_A    D6
 #define CSN_PIN_A   A2
+
 #define CE_PIN_B    D5
 #define CSN_PIN_B   A1
 
@@ -29,9 +31,10 @@ bool boton_presionado = false;
 unsigned long ultimoReporte = 0;
 const unsigned long intervaloReporte = 3000;
 
-// Función manual para leer registros sin librerías externas
+// Función manual ultra-segura para leer registros por SPI1
 uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg) {
     digitalWrite(csn, LOW);
+    delayMicroseconds(5);
     SPI1.transfer(reg & 0x1F);         
     uint8_t resultado = SPI1.transfer(0x00); 
     digitalWrite(csn, HIGH);
@@ -40,8 +43,10 @@ uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg) {
 
 void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uint64_t dir, char id) {
     Serial.printf("[SPI1 -> Radio %c] Inicializando begin()...\n", id);
+    
     radio.begin(&SPI1); 
     
+    // Forzamos los tiempos del bus SPI1 inmediatamente después del begin de la librería
     SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0)); 
     
     radio.setAutoAck(false); 
@@ -52,6 +57,8 @@ void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uin
     radio.setCRCLength(RF24_CRC_DISABLED); 
     radio.setChannel(canal);
     radio.openWritingPipe(dir);
+    
+    SPI1.endTransaction();
 }
 
 void aplicarModoA_Antenas(int modo) {
@@ -68,6 +75,8 @@ void aplicarModoA_Antenas(int modo) {
 
 void setup() {
     Serial.begin(9600);
+    
+    // Liberar botón MODE
     System.enableFeature((HAL_Feature)1);
     
     while(!Serial.isConnected()) {
@@ -75,26 +84,28 @@ void setup() {
     }
 
     Serial.println("\n==================================================");
-    Serial.println("SISTEMA DUAL nRF24L01 - MODO REPORTE SEGURO");
+    Serial.println("SISTEMA DUAL nRF24L01 - FIJADO DE BUS SPI1");
     Serial.println("==================================================");
 
-    SPI1.begin();
-    
-    // Configurar pines de CSN como salidas manuales para el debug rápido
+    // Configurar CSN como salidas estables
     pinMode(CSN_PIN_A, OUTPUT);
     pinMode(CSN_PIN_B, OUTPUT);
     digitalWrite(CSN_PIN_A, HIGH);
     digitalWrite(CSN_PIN_B, HIGH);
 
-    // Primer chequeo rápido de cables antes de arrancar configuraciones pesadas
-    Serial.println("[CHECK] Leyendo registros iniciales directamente del bus SPI...");
+    // DELAY CRÍTICO: Damos tiempo a que tus capacitores de 100uF se llenen de energía
+    // y estabilicen las antenas antes de activar los relojes lógicos
+    delay(1000); 
+
+    SPI1.begin();
+
+    // Chequeo directo de hardware puro
     uint8_t stA = leerRegistroManual(CSN_PIN_A, 0x07);
     uint8_t stB = leerRegistroManual(CSN_PIN_B, 0x07);
-    Serial.printf("   > Registro STATUS Inicial Radio A: 0x%02X\n", stA);
-    Serial.printf("   > Registro STATUS Inicial Radio B: 0x%02X\n", stB);
+    Serial.printf("[CHECK PIN] Registro STATUS Inicial Radio A: 0x%02X\n", stA);
+    Serial.printf("[CHECK PIN] Registro STATUS Inicial Radio B: 0x%02X\n", stB);
 
     aplicarModoA_Antenas(modo_actual);
-    Serial.println("[SISTEMA] Inicialización lista. Entrando al loop principal...");
 }
 
 void loop() {
@@ -115,7 +126,6 @@ void loop() {
         memset(paquete_datos, 0xFF, sizeof(paquete_datos)); 
     }
     
-    // MODIFICACIÓN ANTI-TRABA: startFastWrite manda los bytes sin quedarse esperando respuesta del chip
     radioA.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
     radioB.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
 

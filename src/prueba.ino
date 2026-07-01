@@ -1,7 +1,7 @@
 #include "Particle.h"
 #include <RF24.h>
 
-// Pines de control según tu distribución actual
+// Pines idénticos a tu diagrama físico
 #define CE_PIN_A    D6
 #define CSN_PIN_A   A2
 
@@ -20,8 +20,10 @@ bool boton_presionado = false;
 unsigned long ultimoReporte = 0;
 const unsigned long intervaloReporte = 3000;
 
+// Función manual ultra-segura para leer registros por SPI1
 uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg) {
     digitalWrite(csn, LOW);
+    delayMicroseconds(5);
     SPI1.transfer(reg & 0x1F);         
     uint8_t resultado = SPI1.transfer(0x00); 
     digitalWrite(csn, HIGH);
@@ -30,7 +32,11 @@ uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg) {
 
 void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uint64_t dir, char id) {
     Serial.printf("[SPI1 -> Radio %c] Inicializando begin()...\n", id);
+    
     radio.begin(&SPI1); 
+    
+    // Forzamos los tiempos del bus SPI1 inmediatamente después del begin de la librería
+    SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0)); 
     
     radio.setAutoAck(false); 
     radio.stopListening();   
@@ -40,6 +46,8 @@ void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uin
     radio.setCRCLength(RF24_CRC_DISABLED); 
     radio.setChannel(canal);
     radio.openWritingPipe(dir);
+    
+    SPI1.endTransaction();
 }
 
 void aplicarModoA_Antenas(int modo) {
@@ -56,6 +64,8 @@ void aplicarModoA_Antenas(int modo) {
 
 void setup() {
     Serial.begin(9600);
+    
+    // Liberar botón MODE
     System.enableFeature((HAL_Feature)1);
     
     while(!Serial.isConnected()) {
@@ -63,25 +73,26 @@ void setup() {
     }
 
     Serial.println("\n==================================================");
-    Serial.println("SISTEMA DUAL nRF24L01 - MAPEADO DE PINES SPI1");
+    Serial.println("SISTEMA DUAL nRF24L01 - FIJADO DE BUS SPI1");
     Serial.println("==================================================");
 
+    // Configurar CSN como salidas estables
     pinMode(CSN_PIN_A, OUTPUT);
     pinMode(CSN_PIN_B, OUTPUT);
     digitalWrite(CSN_PIN_A, HIGH);
     digitalWrite(CSN_PIN_B, HIGH);
 
-    delay(500); 
+    // DELAY CRÍTICO: Damos tiempo a que tus capacitores de 100uF se llenen de energía
+    // y estabilicen las antenas antes de activar los relojes lógicos
+    delay(1000); 
 
-    // FORZADO DE PINES: Indicamos explícitamente al Device OS que use D16 para MISO
-    // Parámetros: SPI1.begin(PIN_CSN_POR_DEFECTO, PIN_SCK, PIN_MOSI, PIN_MISO)
-    // Usamos D5 como marcador de posición interno, pero lo controlamos manualmente con A1 y A2
-    SPI1.begin(D5, D17, D15, D16);
+    SPI1.begin();
 
+    // Chequeo directo de hardware puro
     uint8_t stA = leerRegistroManual(CSN_PIN_A, 0x07);
     uint8_t stB = leerRegistroManual(CSN_PIN_B, 0x07);
-    Serial.printf("[CHECK] Registro STATUS Inicial Radio A: 0x%02X\n", stA);
-    Serial.printf("[CHECK] Registro STATUS Inicial Radio B: 0x%02X\n", stB);
+    Serial.printf("[CHECK PIN] Registro STATUS Inicial Radio A: 0x%02X\n", stA);
+    Serial.printf("[CHECK PIN] Registro STATUS Inicial Radio B: 0x%02X\n", stB);
 
     aplicarModoA_Antenas(modo_actual);
 }
