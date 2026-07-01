@@ -1,7 +1,6 @@
-/* 
- * Project myProject
- * Author: Your Name
- * Date: 
+/* * Project myProject
+ * Author: Idwin Balderas
+ * Date: 2026
  * For comprehensive documentation and examples, please visit:
  * https://docs.particle.io/firmware/best-practices/firmware-template/
  */
@@ -11,47 +10,26 @@
 #include "RF24.h"
 
 // Let Device OS manage the connection to the Particle Cloud
-SYSTEM_MODE(AUTOMATIC);
-
-// Run the application and system concurrently in separate threads
-SYSTEM_THREAD(ENABLED);
+SYSTEM_MODE(SEMI_AUTOMATIC);
 
 // Show system, cloud connectivity, and application logs over USB
-// View logs with CLI using 'particle serial monitor --follow'
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-// setup() runs once, when the device is first turned on
-// En tu código de la antena nRF24:
-/*void setup() {
-  radio.begin();
-  radio.setPALevel(RF24_PA_MAX); // Máxima potencia para generar interferencia
-  radio.setChannel(10);          // Canal 10 del nRF24 (aprox 2410 MHz, canal 1 de Wi-Fi)
-  radio.openWritingPipe(pipe);
-}
-
-void loop() {
-  const char ruido[] = "1234567890123456789012345678901"; // Paquete pesado
-  
-  // Transmitir en bucle lo más rápido posible sin delays
-  radio.write(&ruido, sizeof(ruido)); 
-}
-*/
-
-
-
-// Configuramos el sistema en modo SEMI_AUTOMATIC para que no se trabe
-// intentando conectar a la nube si eliges el modo BLE.
+// Configuración de hardware para la antena nRF24
+RF24 radio(D4, D5);
+const uint64_t direccionPipe = 0xE8E8F0F0E1LL; 
 
 // Definición de los estados del menú
 enum ModoSistema {
     MODO_MENU,
     MODO_WIFI,
-    MODO_BLE
+    MODO_BLE,
+    MODO_RF24 
 };
-
 
 ModoSistema modoActual = MODO_MENU;
 unsigned long ultimoEscaneo = 0;
+unsigned long ultimoEscaneoBLE = 0; 
 unsigned long ultimoPublishBLE = 0;
 
 // Prototipos de funciones
@@ -60,52 +38,74 @@ void ejecutarEscaneoWiFi();
 void manejarRedEncontrada(WiFiAccessPoint* ap, void* cookie);
 void onScanResultBLE(const BleScanResult* scanResult, void* context);
 void ejecutarEscaneoBLE();
-
-// NUEVO: Prototipo de la función para la nube
 void miManejadorDeEventos(const char *event, const char *data);
+void publicarYSerial(const char* mensaje);
 
 void setup() {
     // Esperar hasta 5 segundos a que abras el monitor serie en la laptop
     waitFor(Serial.isConnected, 5000);
-    // NUEVO: El Photon se suscribe a tus eventos de la nube.
-    // Escuchará cualquier evento que tú publiques con el nombre "cambiar-modo"
-    Particle.subscribe("cambiar-modo", miManejadorDeEventos, MY_DEVICES);
+    
+    // Inicialización obligatoria de la antena nRF24
+    radio.begin();
+    radio.setPALevel(RF24_PA_MAX); // Máxima potencia para generar interferencia
+    radio.setChannel(10);          // Canal 10 del nRF24 (aprox 2410 MHz, canal 1 de Wi-Fi)
+    radio.openWritingPipe(direccionPipe); 
+    radio.stopListening();         // Configurar en modo transmisión
+
+    // Registro de suscripción para recibir comandos desde "Publish an Event"
+    Particle.subscribe("cambiar-modo", miManejadorDeEventos);
+    
     mostrarMenu();
 }
 
 void loop() {
-    // 1. LEER LOS COMANDOS DESDE LA LAPTOP
+    // 1. LEER LOS COMANDOS DESDE LA LAPTOP Y EL MONITOR SERIE (INTERRUPCIÓN MANUAL)
     if (Serial.available() > 0) {
         char opcion = Serial.read();
         
-        // Limpiar caracteres basura como saltos de línea (\n o \r)
-        if (opcion == '\n' || opcion == '\r') return;
+        if (opcion != '\n' && opcion != '\r') {
+            
+            // ACCIÓN CRÍTICA: Si estábamos en BLE, detenemos el escaneo antes que cualquier otra cosa
+            if (modoActual == MODO_BLE) {
+                BLE.stopScanning();
+                delay(50); 
+            }
 
-        if (opcion == '1') {
-            Log.info("=== Cambiando a Modo: Escáner Wi-Fi ===");
-            modoActual = MODO_WIFI;
-            ultimoEscaneo = 0; // Forzar escaneo inmediato
-        } 
-        else if (opcion == '2') {
-            Log.info("=== Cambiando a Modo: Escáner Bluetooth (BLE) ===");
-            modoActual = MODO_BLE;
-            ultimoEscaneo = 0;
-        } 
-        else if (opcion == 'm' || opcion == 'M') {
-            // Regresar al menú principal y apagar radios si es necesario
-            BLE.off();
-            modoActual = MODO_MENU;
-            mostrarMenu();
-        } 
-        else {
-            Log.warn("Opción no válida. Presiona 1, 2 o M.");
+            if (opcion == '1') {
+                Log.info("=== Cambiando a Modo: Escáner Wi-Fi ===");
+                BLE.off(); 
+                modoActual = MODO_WIFI;
+                ultimoEscaneo = 0; // Forzar escaneo Wi-Fi inmediato
+            }
+            else if (opcion == '2') {
+                Log.info("=== Cambiando a Modo: Escáner Bluetooth (BLE) ===");
+                // Apagamos Wi-Fi para que no genere conflicto con BLE en el chip integrado
+                WiFi.off();
+                modoActual = MODO_BLE;
+                ultimoEscaneoBLE = 0; 
+            } 
+            else if (opcion == '3') {
+                Log.info("=== Cambiando a Modo: Transmisor nRF24 ===");
+                BLE.off(); 
+                WiFi.off();
+                modoActual = MODO_RF24;
+            }
+            else if (opcion == 'm' || opcion == 'M') {
+                Log.info("=== Regresando al Menú Principal ===");
+                BLE.off();
+                WiFi.off();
+                modoActual = MODO_MENU;
+                mostrarMenu();
+            } 
+            else {
+                Log.warn("Opción no válida. Presiona 1, 2, 3 o M.");
+            }
         }
     }
 
     // 2. EJECUTAR EL MODO SELECCIONADO
     switch (modoActual) {
         case MODO_WIFI:
-            // Escanear cada 8 segundos
             if (millis() - ultimoEscaneo >= 8000) {
                 ultimoEscaneo = millis();
                 ejecutarEscaneoWiFi();
@@ -114,127 +114,156 @@ void loop() {
             break;
 
         case MODO_BLE:
-            // El escaneo de BLE es síncrono y toma 4 segundos
-            ejecutarEscaneoBLE();
-            Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú principal.");
-            delay(4000); // Espera entre escaneos
+            if (millis() - ultimoEscaneoBLE >= 5000) { 
+                ultimoEscaneoBLE = millis();
+                ejecutarEscaneoBLE();
+                Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú principal.");
+            }
+            break;
+
+        case MODO_RF24:
+            {
+                const char ruido[] = "1234567890123456789012345678901";
+                radio.write(&ruido, sizeof(ruido));
+            }
             break;
 
         case MODO_MENU:
-            // No hacer nada, esperar la selección del usuario
             break;
     }
 }
 
-
-// NUEVO: Esta función se activa solita cuando publicas el evento en la consola
 void miManejadorDeEventos(const char *event, const char *data) {
-    // Convertimos los datos recibidos a String para manejarlos fácil
     String comando = String(data);
     comando.trim();
 
+    if (modoActual == MODO_BLE) {
+        BLE.stopScanning();
+        delay(50);
+    }
+
     if (comando == "1") {
         Log.info("=== Evento Nube Recibido: Cambiando a Wi-Fi ===");
+        BLE.off();
         modoActual = MODO_WIFI;
-        ultimoEscaneo = millis();
+        ultimoEscaneo = 0;
     } 
     else if (comando == "2") {
         Log.info("=== Evento Nube Recibido: Cambiando a BLE ===");
+        WiFi.off();
         modoActual = MODO_BLE;
-        ultimoEscaneo = millis();
+        ultimoEscaneoBLE = 0;
     } 
+    else if (comando == "3") {
+        Log.info("=== Evento Nube Recibido: Cambiando a Transmisor nRF24 ===");
+        BLE.off();
+        WiFi.off();
+        modoActual = MODO_RF24;
+    }
     else if (comando.equalsIgnoreCase("m")) {
         Log.info("=== Evento Nube Recibido: Cambiando a Menú ===");
         BLE.off();
+        WiFi.off();
         modoActual = MODO_MENU;
         mostrarMenu();
     }
-    else {
-        Log.warn("Evento recibido con datos no válidos: %s", data);
+}
+
+void publicarYSerial(const char* mensaje) {
+    Serial.println(mensaje);
+    // Solo intenta publicar si el dispositivo está conectado a la red y nube de Particle
+    if (Particle.connected()) {
+        Particle.publish("consola-remota", mensaje, PRIVATE);
     }
 }
 
-// Muestra el menú de opciones en la terminal de la laptop
 void mostrarMenu() {
-    Serial.println("\n=============================================");
-    Serial.println("          MENU DE SELECCION - PHOTON 2       ");
-    Serial.println("=============================================");
-    Serial.println(" 1. Activar Escáner de Canales Wi-Fi");
-    Serial.println(" 2. Activar Escáner de Dispositivos BLE");
-    Serial.println("---------------------------------------------");
-    Serial.println(" Escribe el número (1 o 2) y presiona Enter: ");
-    Serial.println("=============================================");
+    const char* menuCompleto = R"(
+=============================================
+       MENU DE SELECCION - PHOTON 2        
+=============================================
+   1. Activar Escáner de Canales Wi-Fi     
+   2. Activar Escáner de Dispositivos BLE  
+   3. Activar Transmisor nRF24            
+---------------------------------------------
+ En la nube publica 'cambiar-modo' con 1, 2, 3 o m
+=============================================
+)";
+    publicarYSerial(menuCompleto);
 }
-
-// 1. Añadimos primero una función "Manejadora" (Callback) para procesar cada red que encuentre el chip
-// IMPORTANTE: Cambiar a AUTOMATIC para que el Photon se conecte al Wi-Fi de tu casa/oficina
-
-// ... (mantén tus definiciones de menús y estados igual) ...
 
 void manejarRedEncontrada(WiFiAccessPoint* ap, void* cookie) {
-    // Seguimos imprimiendo en la laptop por USB si está conectada
-    Serial.printf("SSID: %-25s | Canal: %-3d | Señal: %d dBm\n", ap->ssid, ap->channel, ap->rssi);
-
-    // NUEVO: Crear un formato de texto corto para enviar por Internet
-    char datosRemotos[64];
-    snprintf(datosRemotos, sizeof(datosRemotos), "SSID:%s|Ch:%d|RSSI:%d", ap->ssid, ap->channel, ap->rssi);
-
-    // ENVIAR A INTERNET: Publica el evento en la nube de Particle
-    // "wifi-detectada" es el nombre del evento, datosRemotos es el mensaje, PRIVATE por seguridad
-    Particle.publish("wifi-detectada", datosRemotos, PRIVATE);
+    char bufferConsola[128];
+    snprintf(bufferConsola, sizeof(bufferConsola), "SSID: %-25s | Canal: %-3d | Señal: %d dBm\n", ap->ssid, ap->channel, ap->rssi);
     
-    // Un pequeño retraso para no saturar la nube (límite de 1 evento por segundo en cuentas gratis)
-    delay(1000); 
+    // Imprimimos directo a Serial
+    Serial.print(bufferConsola);
+
+    // Publicamos de forma remota solo si hay conexión nube activa
+    if (Particle.connected()) {
+        char datosRemotos[64];
+        snprintf(datosRemotos, sizeof(datosRemotos), "SSID:%s|Ch:%d|RSSI:%d", ap->ssid, ap->channel, ap->rssi);
+        Particle.publish("wifi-detectada", datosRemotos, PRIVATE);
+    }
+    
+    // ELIMINADO EL DELAY(1000) de aquí para evitar congelar el procesador por cada red.
 }
 
-// ... (el resto de tu lógica del menú y loop se mantiene igual) ...
-// 2. Modificamos la función principal del escaneo
 void ejecutarEscaneoWiFi() {
+    Log.info("Encendiendo módulo de radio Wi-Fi...");
+    WiFi.on(); // <-- CORRECCIÓN CRÍTICA: Activa el hardware antes de interactuar con él.
+    delay(100); // Pequeño delay de asentamiento para el firmware del módulo de red
+
     Log.info("Escaneando canales Wi-Fi cercanos...");
     Serial.println("\n--- REDES WI-FI DETECTADAS ---");
     
-    // Llamamos a WiFi.scan pasándole nuestra función manejadora.
-    // El chip de radio se encarga de buscar y dirigir los resultados ahí.
     int redesEncontradas = WiFi.scan(manejarRedEncontrada, NULL);
     
     if (redesEncontradas > 0) {
-        Serial.printf("-------------------------------\nTotal de redes impresas: %d\n\n", redesEncontradas);
+        char bufferFin[128]; 
+        snprintf(bufferFin, sizeof(bufferFin), "-------------------------------\nTotal de redes impresas: %d\n\n", redesEncontradas);
+        Serial.println(bufferFin);
     } else {
-        Serial.println("No se detectaron redes en este escaneo o el radio está ocupado.");
-        Serial.println("-------------------------------\n");
+        Serial.println("No se detectaron redes en este escaneo o el radio está ocupado.\n-------------------------------\n\n");
     }
 }
 
-// Callback para procesar cada dispositivo Bluetooth encontrado
 void onScanResultBLE(const BleScanResult* scanResult, void* context) {
     BleAddress addr = scanResult->address();
     String name = scanResult->advertisingData().deviceName();
     if (name.length() == 0) name = "[Anonimo]";
 
-    // Imprimir de manera local en consola
-    Serial.printf("MAC: %s | RSSI: %d dBm | Nombre: %s\n", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+    char bufferConsola[128];
+    snprintf(bufferConsola, sizeof(bufferConsola), "MAC: %s | RSSI: %d dBm | Nombre: %s\n", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+    Serial.print(bufferConsola);
 
-    // NUEVO: Preparar y enviar la información del dispositivo BLE a la nube de Particle
-    char datosBle[128];
-    snprintf(datosBle, sizeof(datosBle), "MAC:%s|RSSI:%d|Name:%s", addr.toString().c_str(), scanResult->rssi(), name.c_str());
-    
-    // Publicamos con el nombre de evento "ble-detectado"
-    Particle.publish("ble-detectado", datosBle, PRIVATE);
-    
-    // Pequeño delay para no saturar el canal de comunicación con la nube
-    delay(1000);
+    if (Particle.connected()) {
+        char datosBle[128];
+        snprintf(datosBle, sizeof(datosBle), "MAC:%s|RSSI:%d|Name:%s", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+        Particle.publish("ble-detectado", datosBle, PRIVATE);
+    }
 }
 
-// Lógica del escáner Bluetooth
 void ejecutarEscaneoBLE() {
     Log.info("Iniciando escaneo BLE (4 segundos)...");
     Serial.println("\n--- DISPOSITIVOS BLE DETECTADOS ---");
     
     BLE.on();
-    BLE.setScanTimeout(400); // 400 unidades de 10ms = 4 segundos
+
+    // Configuración limpia y segura de parámetros para el Argon
+    BleScanParams scanParams;
+    memset(&scanParams, 0, sizeof(BleScanParams)); // Borrar basura en memoria
+    scanParams.size = sizeof(BleScanParams);
+    scanParams.active = true; // Activa la solicitud de nombres (Scan Response)
+    
+    // Dejando interval y window en 0, el Argon usa los valores estables por defecto del sistema
+    scanParams.interval = 0; 
+    scanParams.window = 0;
+    
+    BLE.setScanParameters(&scanParams);
+    
+    BLE.setScanTimeout(400); 
     BLE.scan(onScanResultBLE, NULL);
     
-    Serial.println("-----------------------------------\n");
+    Serial.println("-----------------------------------\n\n");
 }
-
-
