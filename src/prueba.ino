@@ -1,8 +1,8 @@
-/* * Project: Mega-Jammer-Dual-SPI1
+/* * Project: Mega-Jammer-Dual-SPI1-Multithread
  * Author: Idwin Balderas & Gemini
  * Date: 2026
  * Description: Sistema unificado con escáner Wi-Fi/BLE (módulo interno) 
- * y Transmisor de alta potencia Dual nRF24L01 sobre SPI1.
+ * y Transmisor de alta potencia Dual nRF24L01 sobre SPI1 optimizado con multihilos.
  */
 
 #include "Particle.h"
@@ -27,11 +27,11 @@ RF24 radioB(CE_PIN_B, CSN_PIN_B);
 const uint64_t direccion_wifi = 0xE8E8F0F0E1LL;
 const uint64_t direccion_ble  = 0x42414c4542LL;
 
-int sub_modo_rf24 = 0; // 0 = BLE, 1 = Wi-Fi (Controlado por el botón MODE)
-bool boton_presionado = false;
+volatile int sub_modo_rf24 = 0; // 0 = BLE, 1 = Wi-Fi (Controlado por el botón MODE)
+volatile bool boton_presionado = false;
 
-unsigned long ultimoReporteHW = 0;
-const unsigned long intervaloReporteHW = 3000;
+volatile unsigned long ultimoReporteHW = 0;
+const unsigned long intervaloReporteHW = 10000; // Reporte cada 10 segundos
 
 // ==========================================
 //          ESTADOS DEL MENÚ GENERAL
@@ -43,11 +43,18 @@ enum ModoSistema {
     MODO_RF24 
 };
 
-ModoSistema modoActual = MODO_MENU;
-unsigned long ultimoEscaneoWiFi = 0;
-unsigned long ultimoEscaneoBLE  = 0;
-uint8_t canal_barrido_A = 0;
-uint8_t canal_barrido_B = 62; // Empezamos a la mitad del espectro para cubrir más rango en paralelo
+volatile ModoSistema modoActual = MODO_MENU;
+volatile unsigned long ultimoEscaneoWiFi = 0;
+volatile unsigned long ultimoEscaneoBLE  = 0;
+volatile uint8_t canal_barrido_A = 0;
+volatile uint8_t canal_barrido_B = 62; // Empezamos a la mitad del espectro
+
+// ==========================================
+//        DECLARACIÓN DEL HILO SECUNDARIO
+// ==========================================
+Thread* hiloControl;
+os_thread_return_t funcionHiloControl(void* param);
+
 // Prototipos de funciones
 void mostrarMenu();
 void ejecutarEscaneoWiFi();
@@ -71,7 +78,7 @@ void setup() {
     System.enableFeature((HAL_Feature)1);
 
     Serial.println("\n==================================================");
-    Serial.println("SISTEMA CENTRALIZADO: ESCÁNERES + DUAL nRF24 (SPI1)");
+    Serial.println("SISTEMA MULTI-HILO: BARRIDO EXTERNO + MENÚ DE FONDO");
     Serial.println("==================================================");
 
     // Configurar CSN como salidas estables antes de encender el bus SPI1
@@ -80,7 +87,7 @@ void setup() {
     digitalWrite(CSN_PIN_A, HIGH);
     digitalWrite(CSN_PIN_B, HIGH);
 
-    // DELAY CRÍTICO: Carga de capacitores de 100uF para estabilizar las antenas
+    // DELAY CRÍTICO: Carga de capacitores de 100uF para las antenas
     delay(1000);
     SPI1.begin();
 
@@ -96,115 +103,138 @@ void setup() {
     // Inicializar frecuencias base de las antenas externas
     aplicarCanalesDualnRF24(sub_modo_rf24);
 
+    // LANZAMIENTO DEL HILO SECUNDARIO (Se encarga del Monitor Serial, Modos y Logs)
+    hiloControl = new Thread("HiloAsincronoControl", funcionHiloControl, NULL, OS_THREAD_PRIORITY_CRITICAL - 4);
+
     mostrarMenu();
 }
 
 // ==========================================
-//                  LOOP
+//       HILO PRINCIPAL: TRANSMISIÓN PURA
 // ==========================================
 void loop() {
-    // 1. CONTROL DE COMANDOS POR MONITOR SERIE (LAPTOP)
-    if (Serial.available() > 0) {
-        char opcion = Serial.read();
-        
-        if (opcion != '\n' && opcion != '\r') {
-            
-            // Acción preventiva de limpieza antes de cambiar de estado
-            if (modoActual == MODO_BLE) {
-                BLE.stopScanning();
-                delay(50); 
-            }
+    if (modoActual == MODO_RF24) {
+        // 1. Avanzar los canales en cada ciclo (Barrido Automático continuo)
+        canal_barrido_A++;
+        canal_barrido_B++;
 
-            if (opcion == '1') {
-                Log.info("=== Cambiando a Modo: Escáner Wi-Fi ===");
-                BLE.off(); 
-                modoActual = MODO_WIFI;
-                ultimoEscaneoWiFi = 0; // Forzar escaneo Wi-Fi inmediato
-            }
-            else if (opcion == '2') {
-                Log.info("=== Cambiando a Modo: Escáner Bluetooth (BLE) ===");
-                WiFi.off();
-                modoActual = MODO_BLE;
-                ultimoEscaneoBLE = 0; 
-            } 
-            else if (opcion == '3') {
-                Log.info("=== Cambiando a Modo: Transmisor Dual nRF24 ===");
-                BLE.off(); 
-                WiFi.off();
-                modoActual = MODO_RF24;
-            }
-            else if (opcion == 'm' || opcion == 'M') {
-                Log.info("=== Regresando al Menú Principal ===");
-                BLE.off();
-                WiFi.off();
-                modoActual = MODO_MENU;
-                mostrarMenu();
-            } 
-            else {
-                Log.warn("Opción no válida. Presiona 1, 2, 3 o M.");
-            }
+        if (canal_barrido_A > 125) canal_barrido_A = 0;
+        if (canal_barrido_B > 125) canal_barrido_B = 0;
+
+        // 2. Aplicar los nuevos canales al vuelo protegiendo la transacción SPI1
+        SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+        radioA.setChannel(canal_barrido_A);
+        radioB.setChannel(canal_barrido_B);
+        SPI1.endTransaction();
+
+        // 3. Preparar y enviar el paquete de datos inmediatamente
+        {
+            char paquete_datos[32];
+            memset(paquete_datos, 0xAA, sizeof(paquete_datos)); 
+            
+            radioA.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
+            radioB.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
         }
     }
+    // El loop principal no contiene NADA que interrumpa o detenga el procesamiento.
+}
 
-    // 2. MÁQUINA DE ESTADOS RECURRENTE
-    switch (modoActual) {
-        case MODO_WIFI:
-            if (millis() - ultimoEscaneoWiFi >= 8000) {
-                ultimoEscaneoWiFi = millis();
-                ejecutarEscaneoWiFi();
-                Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú.");
+// ==========================================
+//    HILO SECUNDARIO: GESTIÓN ASÍNCRONA
+// ==========================================
+os_thread_return_t funcionHiloControl(void* param) {
+    while(true) {
+        // 1. CONTROL DE COMANDOS POR MONITOR SERIE (LAPTOP)
+        if (Serial.available() > 0) {
+            char opcion = Serial.read();
+            
+            if (opcion != '\n' && opcion != '\r') {
+                if (modoActual == MODO_BLE) {
+                    BLE.stopScanning();
+                    delay(50); 
+                }
+
+                if (opcion == '1') {
+                    Log.info("=== Cambiando a Modo: Escáner Wi-Fi ===");
+                    BLE.off(); 
+                    modoActual = MODO_WIFI;
+                    ultimoEscaneoWiFi = 0; 
+                }
+                else if (opcion == '2') {
+                    Log.info("=== Cambiando a Modo: Escáner Bluetooth (BLE) ===");
+                    WiFi.off();
+                    modoActual = MODO_BLE;
+                    ultimoEscaneoBLE = 0; 
+                } 
+                else if (opcion == '3') {
+                    Log.info("=== Cambiando a Modo: Transmisor Dual nRF24 ===");
+                    BLE.off(); 
+                    WiFi.off();
+                    modoActual = MODO_RF24;
+                }
+                else if (opcion == 'm' || opcion == 'M') {
+                    Log.info("=== Regresando al Menú Principal ===");
+                    BLE.off();
+                    WiFi.off();
+                    modoActual = MODO_MENU;
+                    mostrarMenu();
+                } 
+                else {
+                    Log.warn("Opción no válida. Presiona 1, 2, 3 o M.");
+                }
             }
-            break;
+        }
 
-        case MODO_BLE:
-            if (millis() - ultimoEscaneoBLE >= 5000) { 
-                ultimoEscaneoBLE = millis();
-                ejecutarEscaneoBLE();
-                Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú.");
-            }
-            break;
+        // 2. MÁQUINA DE ESTADOS RECURRENTE (SOLO ESCÁNERES E IMPRESIONES)
+        switch (modoActual) {
+            case MODO_WIFI:
+                if (millis() - ultimoEscaneoWiFi >= 8000) {
+                    ultimoEscaneoWiFi = millis();
+                    ejecutarEscaneoWiFi();
+                    Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú.");
+                }
+                break;
 
-        case MODO_RF24:
-            // 1. Alternar o avanzar los canales en cada ciclo (Barrido Automático)
-            canal_barrido_A++;
-            canal_barrido_B++;
+            case MODO_BLE:
+                if (millis() - ultimoEscaneoBLE >= 5000) { 
+                    ultimoEscaneoBLE = millis();
+                    ejecutarEscaneoBLE();
+                    Log.info("[Tip] Presiona 'M' en el teclado para regresar al menú.");
+                }
+                break;
 
-            // Reiniciar si superan el límite de 125 canales
-            if (canal_barrido_A > 125) canal_barrido_A = 0;
-            if (canal_barrido_B > 125) canal_barrido_B = 0;
+            case MODO_RF24:
+                // Interrupción física por botón MODE para alternar bandas fijas (Opcional en barrido)
+                if (System.buttonPushed()) {
+                    if (!boton_presionado) {
+                        boton_presionado = true;
+                        sub_modo_rf24 = !sub_modo_rf24; 
+                        aplicarCanalesDualnRF24(sub_modo_rf24);
+                    }
+                } else {
+                    boton_presionado = false;
+                }
 
-            // 2. Aplicar los nuevos canales al vuelo de forma rápida
-            SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-            radioA.setChannel(canal_barrido_A);
-            radioB.setChannel(canal_barrido_B);
-            SPI1.endTransaction();
+                // Reporte de salud periódico asíncrono
+                if (millis() - ultimoReporteHW >= intervaloReporteHW) {
+                    ultimoReporteHW = millis();
+                    uint8_t statusA  = leerRegistroManual(CSN_PIN_A, 0x07);
+                    uint8_t statusB  = leerRegistroManual(CSN_PIN_B, 0x07);
 
-            // 3. Preparar y enviar el paquete de datos inmediatamente
-            {
-                char paquete_datos[32];
-                // Llenamos con un patrón de bits alternados (0xAA = 10101010) para generar ruido constante
-                memset(paquete_datos, 0xAA, sizeof(paquete_datos)); 
-                
-                radioA.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
-                radioB.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
-            }
+                    Serial.printf("\n[%ds][HILO CONTROL] ----------- MONITOREO DE HARDWARE -----------\n", (int)(millis()/1000));
+                    Serial.printf("RADIO A -> STATUS: 0x%02X | Último Canal en ráfaga: %d\n", statusA, canal_barrido_A);
+                    Serial.printf("RADIO B -> STATUS: 0x%02X | Último Canal en ráfaga: %d\n", statusB, canal_barrido_B);
+                    Serial.println("-----------------------------------------------------------------\n");
+                }
+                break;
 
-            // 4. Reporte de salud periódico cada 3 segundos (para no saturar el Monitor Serie)
-            if (millis() - ultimoReporteHW >= intervaloReporteHW) {
-                ultimoReporteHW = millis();
-                uint8_t statusA  = leerRegistroManual(CSN_PIN_A, 0x07);
-                uint8_t statusB  = leerRegistroManual(CSN_PIN_B, 0x07);
+            case MODO_MENU:
+                break;
+        }
 
-                Serial.printf("\n[%ds] ----------- BARRIDO AUTOMÁTICO ACTIVO -----------\n", (int)(millis()/1000));
-                Serial.printf("RADIO A -> STATUS: 0x%02X | Canal Actual: %d\n", statusA, canal_barrido_A);
-                Serial.printf("RADIO B -> STATUS: 0x%02X | Canal Actual: %d\n", statusB, canal_barrido_B);
-                Serial.println("-------------------------------------------------------\n");
-            }
-            break;
-
-        case MODO_MENU:
-            // En reposo, esperando comandos
-            break;
+        // Delay obligatorio del sistema operativo para liberar CPU y permitir la multitarea
+        // POR ESTO:
+        delay(15);
     }
 }
 
@@ -212,11 +242,13 @@ void loop() {
 //    MANEJADORES Y FUNCIONES DE NRF24 (SPI1)
 // ==========================================
 uint8_t leerRegistroManual(rf24_gpio_pin_t csn, uint8_t reg) {
+    SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
     digitalWrite(csn, LOW);
     delayMicroseconds(5);
     SPI1.transfer(reg & 0x1F);         
     uint8_t resultado = SPI1.transfer(0x00); 
     digitalWrite(csn, HIGH);
+    SPI1.endTransaction();
     return resultado;
 }
 
@@ -224,7 +256,6 @@ void configureAntenna(RF24 &radio, uint8_t canal, rf24_datarate_e velocidad, uin
     Serial.printf("[SPI1 -> Radio %c] Seteando configuraciones de RF...\n", id);
     radio.begin(&SPI1); 
     
-    // Fijación estricta de tiempos del bus SPI1
     SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
     radio.setAutoAck(false); 
     radio.stopListening();   
@@ -364,15 +395,14 @@ void publicarYSerial(const char* mensaje) {
 void mostrarMenu() {
     const char* menuCompleto = R"(
 =============================================
-       MENU DE SELECCION CENTRALIZADO        
+       MENU DE SELECCION MULTI-HILO        
 =============================================
    1. Activar Escáner de Canales Wi-Fi (Chip)
    2. Activar Escáner de Dispositivos BLE (Chip)
    3. Activar Transmisor DUAL nRF24L01 (SPI1)
 ---------------------------------------------
- * En Modo 3, usa el botón físico 'MODE' para 
-   switchear los canales de las antenas externas.
- * Envía por evento nube con 1, 2, 3 o m
+ * El bucle de transmisión corre de forma pura
+   en el hilo principal sin frenarse por la consola.
 =============================================
 )";
     publicarYSerial(menuCompleto);
