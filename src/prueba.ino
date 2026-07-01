@@ -46,7 +46,8 @@ enum ModoSistema {
 ModoSistema modoActual = MODO_MENU;
 unsigned long ultimoEscaneoWiFi = 0;
 unsigned long ultimoEscaneoBLE  = 0;
-
+uint8_t canal_barrido_A = 0;
+uint8_t canal_barrido_B = 62; // Empezamos a la mitad del espectro para cubrir más rango en paralelo
 // Prototipos de funciones
 void mostrarMenu();
 void ejecutarEscaneoWiFi();
@@ -164,42 +165,40 @@ void loop() {
             break;
 
         case MODO_RF24:
-            // Interrupción física por botón MODE para alternar bandas del nRF24 en caliente
-            if (System.buttonPushed()) {
-                if (!boton_presionado) {
-                    boton_presionado = true;
-                    sub_modo_rf24 = !sub_modo_rf24; 
-                    aplicarCanalesDualnRF24(sub_modo_rf24);
-                }
-            } else {
-                boton_presionado = false;
-            }
+            // 1. Alternar o avanzar los canales en cada ciclo (Barrido Automático)
+            canal_barrido_A++;
+            canal_barrido_B++;
 
-            // Envío masivo ininterrumpido a través de ambas antenas en paralelo
+            // Reiniciar si superan el límite de 125 canales
+            if (canal_barrido_A > 125) canal_barrido_A = 0;
+            if (canal_barrido_B > 125) canal_barrido_B = 0;
+
+            // 2. Aplicar los nuevos canales al vuelo de forma rápida
+            SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+            radioA.setChannel(canal_barrido_A);
+            radioB.setChannel(canal_barrido_B);
+            SPI1.endTransaction();
+
+            // 3. Preparar y enviar el paquete de datos inmediatamente
             {
                 char paquete_datos[32];
-                if (sub_modo_rf24 == 0) {
-                    memset(paquete_datos, 0xAA, sizeof(paquete_datos)); // Patrón BLE
-                } else {
-                    memset(paquete_datos, 0xFF, sizeof(paquete_datos)); // Patrón Wi-Fi
-                }
+                // Llenamos con un patrón de bits alternados (0xAA = 10101010) para generar ruido constante
+                memset(paquete_datos, 0xAA, sizeof(paquete_datos)); 
                 
                 radioA.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
                 radioB.startFastWrite(&paquete_datos, sizeof(paquete_datos), false);
             }
 
-            // Reporte de salud periódico de los chips nRF24
+            // 4. Reporte de salud periódico cada 3 segundos (para no saturar el Monitor Serie)
             if (millis() - ultimoReporteHW >= intervaloReporteHW) {
                 ultimoReporteHW = millis();
                 uint8_t statusA  = leerRegistroManual(CSN_PIN_A, 0x07);
-                uint8_t channelA = leerRegistroManual(CSN_PIN_A, 0x05);
                 uint8_t statusB  = leerRegistroManual(CSN_PIN_B, 0x07);
-                uint8_t channelB = leerRegistroManual(CSN_PIN_B, 0x05);
 
-                Serial.printf("\n[%ds] ----------- STATUS DUAL nRF24 -----------\n", (int)(millis()/1000));
-                Serial.printf("RADIO A -> STATUS: 0x%02X | Canal: %d -> %s\n", statusA, channelA, (statusA == 0x00 || statusA == 0xFF) ? "[FALLO SPI/ENERGÍA]" : "[TX OK]");
-                Serial.printf("RADIO B -> STATUS: 0x%02X | Canal: %d -> %s\n", statusB, channelB, (statusB == 0x00 || statusB == 0xFF) ? "[FALLO SPI/ENERGÍA]" : "[TX OK]");
-                Serial.println("---------------------------------------------\n");
+                Serial.printf("\n[%ds] ----------- BARRIDO AUTOMÁTICO ACTIVO -----------\n", (int)(millis()/1000));
+                Serial.printf("RADIO A -> STATUS: 0x%02X | Canal Actual: %d\n", statusA, canal_barrido_A);
+                Serial.printf("RADIO B -> STATUS: 0x%02X | Canal Actual: %d\n", statusB, canal_barrido_B);
+                Serial.println("-------------------------------------------------------\n");
             }
             break;
 
