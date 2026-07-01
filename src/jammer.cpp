@@ -14,7 +14,7 @@
 SYSTEM_MODE(AUTOMATIC);
 
 // Run the application and system concurrently in separate threads
-//SYSTEM_THREAD(ENABLED);
+SYSTEM_THREAD(ENABLED);
 
 // Show system, cloud connectivity, and application logs over USB
 // View logs with CLI using 'particle serial monitor --follow'
@@ -49,18 +49,27 @@ enum ModoSistema {
     MODO_BLE
 };
 
+
 ModoSistema modoActual = MODO_MENU;
 unsigned long ultimoEscaneo = 0;
+unsigned long ultimoPublishBLE = 0;
 
 // Prototipos de funciones
 void mostrarMenu();
 void ejecutarEscaneoWiFi();
+void manejarRedEncontrada(WiFiAccessPoint* ap, void* cookie);
 void onScanResultBLE(const BleScanResult* scanResult, void* context);
 void ejecutarEscaneoBLE();
+
+// NUEVO: Prototipo de la función para la nube
+void miManejadorDeEventos(const char *event, const char *data);
 
 void setup() {
     // Esperar hasta 5 segundos a que abras el monitor serie en la laptop
     waitFor(Serial.isConnected, 5000);
+    // NUEVO: El Photon se suscribe a tus eventos de la nube.
+    // Escuchará cualquier evento que tú publiques con el nombre "cambiar-modo"
+    Particle.subscribe("cambiar-modo", miManejadorDeEventos, MY_DEVICES);
     mostrarMenu();
 }
 
@@ -117,6 +126,34 @@ void loop() {
     }
 }
 
+
+// NUEVO: Esta función se activa solita cuando publicas el evento en la consola
+void miManejadorDeEventos(const char *event, const char *data) {
+    // Convertimos los datos recibidos a String para manejarlos fácil
+    String comando = String(data);
+    comando.trim();
+
+    if (comando == "1") {
+        Log.info("=== Evento Nube Recibido: Cambiando a Wi-Fi ===");
+        modoActual = MODO_WIFI;
+        ultimoEscaneo = millis();
+    } 
+    else if (comando == "2") {
+        Log.info("=== Evento Nube Recibido: Cambiando a BLE ===");
+        modoActual = MODO_BLE;
+        ultimoEscaneo = millis();
+    } 
+    else if (comando.equalsIgnoreCase("m")) {
+        Log.info("=== Evento Nube Recibido: Cambiando a Menú ===");
+        BLE.off();
+        modoActual = MODO_MENU;
+        mostrarMenu();
+    }
+    else {
+        Log.warn("Evento recibido con datos no válidos: %s", data);
+    }
+}
+
 // Muestra el menú de opciones en la terminal de la laptop
 void mostrarMenu() {
     Serial.println("\n=============================================");
@@ -168,13 +205,24 @@ void ejecutarEscaneoWiFi() {
     }
 }
 
-// Callback obligatorio para procesar cada dispositivo Bluetooth encontrado
+// Callback para procesar cada dispositivo Bluetooth encontrado
 void onScanResultBLE(const BleScanResult* scanResult, void* context) {
     BleAddress addr = scanResult->address();
     String name = scanResult->advertisingData().deviceName();
-    if (name.length() == 0) name = "[Anónimo]";
+    if (name.length() == 0) name = "[Anonimo]";
 
+    // Imprimir de manera local en consola
     Serial.printf("MAC: %s | RSSI: %d dBm | Nombre: %s\n", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+
+    // NUEVO: Preparar y enviar la información del dispositivo BLE a la nube de Particle
+    char datosBle[128];
+    snprintf(datosBle, sizeof(datosBle), "MAC:%s|RSSI:%d|Name:%s", addr.toString().c_str(), scanResult->rssi(), name.c_str());
+    
+    // Publicamos con el nombre de evento "ble-detectado"
+    Particle.publish("ble-detectado", datosBle, PRIVATE);
+    
+    // Pequeño delay para no saturar el canal de comunicación con la nube
+    delay(1000);
 }
 
 // Lógica del escáner Bluetooth
