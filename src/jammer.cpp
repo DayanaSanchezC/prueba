@@ -130,11 +130,27 @@ void mostrarMenu() {
 }
 
 // 1. Añadimos primero una función "Manejadora" (Callback) para procesar cada red que encuentre el chip
+// IMPORTANTE: Cambiar a AUTOMATIC para que el Photon se conecte al Wi-Fi de tu casa/oficina
+
+// ... (mantén tus definiciones de menús y estados igual) ...
+
 void manejarRedEncontrada(WiFiAccessPoint* ap, void* cookie) {
-    // Esta función se ejecuta automáticamente por cada red Wi-Fi que detecte el radio
+    // Seguimos imprimiendo en la laptop por USB si está conectada
     Serial.printf("SSID: %-25s | Canal: %-3d | Señal: %d dBm\n", ap->ssid, ap->channel, ap->rssi);
+
+    // NUEVO: Crear un formato de texto corto para enviar por Internet
+    char datosRemotos[64];
+    snprintf(datosRemotos, sizeof(datosRemotos), "SSID:%s|Ch:%d|RSSI:%d", ap->ssid, ap->channel, ap->rssi);
+
+    // ENVIAR A INTERNET: Publica el evento en la nube de Particle
+    // "wifi-detectada" es el nombre del evento, datosRemotos es el mensaje, PRIVATE por seguridad
+    Particle.publish("wifi-detectada", datosRemotos, PRIVATE);
+    
+    // Un pequeño retraso para no saturar la nube (límite de 1 evento por segundo en cuentas gratis)
+    delay(1000); 
 }
 
+// ... (el resto de tu lógica del menú y loop se mantiene igual) ...
 // 2. Modificamos la función principal del escaneo
 void ejecutarEscaneoWiFi() {
     Log.info("Escaneando canales Wi-Fi cercanos...");
@@ -172,3 +188,5 @@ void ejecutarEscaneoBLE() {
     
     Serial.println("-----------------------------------\n");
 }
+
+
